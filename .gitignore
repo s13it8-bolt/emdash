@@ -62,6 +62,9 @@ __screenshots__/
 
 .chainlink/
 
+# Git worktrees
+.worktrees/
+
 .emdash-bundle-tmp
 
 # Downloaded test data (fetched on demand in CI)
