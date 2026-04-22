@@ -5,6 +5,7 @@
  * Vite-specific configuration for EmDash.
  */
 
+import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -12,6 +13,7 @@ import { fileURLToPath } from "node:url";
 import type { AstroConfig } from "astro";
 import type { Plugin } from "vite";
 
+import { COMMIT, VERSION } from "../../version.js";
 import type { EmDashConfig, PluginDescriptor } from "./runtime.js";
 import {
 	VIRTUAL_CONFIG_ID,
@@ -36,7 +38,10 @@ import {
 	RESOLVED_VIRTUAL_BLOCK_COMPONENTS_ID,
 	VIRTUAL_SEED_ID,
 	RESOLVED_VIRTUAL_SEED_ID,
+	VIRTUAL_WAIT_UNTIL_ID,
+	RESOLVED_VIRTUAL_WAIT_UNTIL_ID,
 	generateSeedModule,
+	generateWaitUntilModule,
 	generateConfigModule,
 	generateDialectModule,
 	generateStorageModule,
@@ -48,6 +53,45 @@ import {
 	generateMediaProvidersModule,
 	generateBlockComponentsModule,
 } from "./virtual-modules.js";
+
+const LOCALE_MESSAGES_RE = /[/\\]([a-z]{2}(?:-[A-Z]{2})?)[/\\]messages\.mjs$/;
+/**
+ * Vite plugin that compiles Lingui macros in admin source files.
+ * Only active in dev mode when the admin package is aliased to source for HMR.
+ * @babel/core is dynamically imported from admin's devDependencies —
+ * not declared by core, never ships to end users.
+ */
+function linguiMacroPlugin(adminSourcePath: string, adminDistPath: string): Plugin {
+	// Resolve @babel/core from admin's devDependencies, not core's.
+	const adminRequire = createRequire(resolve(adminDistPath, "index.js"));
+	const babelCorePath = adminRequire.resolve("@babel/core");
+
+	return {
+		name: "emdash-lingui-macro",
+		enforce: "pre",
+		resolveId(id, importer) {
+			// Redirect relative locale catalog imports (e.g. ./de/messages.mjs) from
+			// within admin source to the compiled dist/locales/ directory, since
+			// lingui compile only runs during build — not in dev watch mode.
+			if (!importer?.startsWith(adminSourcePath)) return;
+			const match = id.match(LOCALE_MESSAGES_RE);
+			if (match?.[1]) {
+				return resolve(adminDistPath, "locales", match[1], "messages.mjs");
+			}
+		},
+		async transform(code, id) {
+			if (!id.startsWith(adminSourcePath) || !code.includes("@lingui")) return;
+			const { transformAsync } = (await import(babelCorePath)) as typeof import("@babel/core");
+			const result = await transformAsync(code, {
+				filename: id,
+				plugins: ["@lingui/babel-plugin-lingui-macro"],
+				parserOpts: { plugins: ["jsx", "typescript"] },
+			});
+			if (!result?.code) return;
+			return { code: result.code, map: result.map ?? undefined };
+		},
+	};
+}
 
 /**
  * Resolve path to the admin package dist directory.
@@ -72,13 +116,8 @@ function resolveAdminSource(): string | undefined {
 	const packageRoot = resolve(dirname(adminPath), "..");
 	const srcEntry = resolve(packageRoot, "src", "index.ts");
 
-	// Only use source alias if the source directory actually exists
-	// (won't exist in published packages, only in the monorepo)
 	try {
-		// Use require.resolve mechanics — if the file exists, return the source dir
-		// eslint-disable-next-line typescript-eslint(no-unsafe-type-assertion) -- CJS require returns any
-		const fs = require("node:fs") as typeof import("node:fs");
-		if (fs.existsSync(srcEntry)) {
+		if (existsSync(srcEntry)) {
 			return resolve(packageRoot, "src");
 		}
 	} catch {
@@ -140,6 +179,9 @@ export function createVirtualModulesPlugin(options: VitePluginOptions): Plugin {
 			if (id === VIRTUAL_SEED_ID) {
 				return RESOLVED_VIRTUAL_SEED_ID;
 			}
+			if (id === VIRTUAL_WAIT_UNTIL_ID) {
+				return RESOLVED_VIRTUAL_WAIT_UNTIL_ID;
+			}
 		},
 		load(id: string) {
 			if (id === RESOLVED_VIRTUAL_CONFIG_ID) {
@@ -148,11 +190,11 @@ export function createVirtualModulesPlugin(options: VitePluginOptions): Plugin {
 			// Generate a module that statically imports the configured dialect
 			// This allows Vite to properly resolve and bundle it
 			if (id === RESOLVED_VIRTUAL_DIALECT_ID) {
-				return generateDialectModule(
-					resolvedConfig.database?.entrypoint,
-					resolvedConfig.database?.type,
-					resolvedConfig.database?.config,
-				);
+				return generateDialectModule({
+					entrypoint: resolvedConfig.database?.entrypoint,
+					type: resolvedConfig.database?.type,
+					supportsRequestScope: resolvedConfig.database?.supportsRequestScope ?? false,
+				});
 			}
 			// Generate a module that statically imports the configured storage
 			if (id === RESOLVED_VIRTUAL_STORAGE_ID) {
@@ -199,6 +241,11 @@ export function createVirtualModulesPlugin(options: VitePluginOptions): Plugin {
 				const projectRoot = fileURLToPath(astroConfig.root);
 				return generateSeedModule(projectRoot);
 			}
+			// Generate wait-until module — re-exports cloudflare:workers'
+			// waitUntil under the Cloudflare adapter, undefined otherwise.
+			if (id === RESOLVED_VIRTUAL_WAIT_UNTIL_ID) {
+				return generateWaitUntilModule(astroConfig.adapter?.name);
+			}
 		},
 	};
 }
@@ -243,6 +290,15 @@ export function createViteConfig(
 	const useSource = adminSourcePath !== undefined;
 
 	return {
+		// Astro SSR routes resolve version.ts from source (not tsdown dist),
+		// so Vite needs its own define pass for the __EMDASH_*__ placeholders.
+		define: {
+			__EMDASH_VERSION__: JSON.stringify(VERSION),
+			__EMDASH_COMMIT__: JSON.stringify(COMMIT),
+			__EMDASH_PSEUDO_LOCALE__: JSON.stringify(
+				isDev && process.env["EMDASH_PSEUDO_LOCALE"] === "1",
+			),
+		},
 		resolve: {
 			dedupe: ["@emdash-cms/admin", "react", "react-dom"],
 			// Array form so more-specific entries are checked first.
@@ -250,14 +306,18 @@ export function createViteConfig(
 			// Vite's prefix matching on "@emdash-cms/admin" would resolve
 			// "@emdash-cms/admin/styles.css" through the source directory.
 			alias: [
-				// CSS: always dist (pre-compiled by @tailwindcss/cli)
 				{ find: "@emdash-cms/admin/styles.css", replacement: resolve(adminDistPath, "styles.css") },
-				// JS: source in dev (HMR), dist in build
 				{ find: "@emdash-cms/admin", replacement: useSource ? adminSourcePath : adminDistPath },
 			],
 		},
 		// eslint-disable-next-line typescript-eslint(no-unsafe-type-assertion) -- Monorepo has both vite 6 (docs) and vite 7 (core). tsgo resolves correctly.
-		plugins: [createVirtualModulesPlugin(options)] as NonNullable<AstroConfig["vite"]>["plugins"],
+		plugins: [
+			createVirtualModulesPlugin(options),
+			// In dev mode with source alias, compile Lingui macros on the fly
+			// and redirect locale .mjs imports to dist/.
+			// In production, macros are pre-compiled by tsdown in the admin package.
+			...(useSource ? [linguiMacroPlugin(adminSourcePath!, adminDistPath)] : []),
+		] as NonNullable<AstroConfig["vite"]>["plugins"],
 		// Handle native modules for SSR.
 		// On Node: external keeps native addons out of the SSR bundle.
 		// On Cloudflare: skip — the adapter handles externalization, and setting
@@ -299,6 +359,10 @@ export function createViteConfig(
 							"emdash > @emdash-cms/auth > @oslojs/crypto/ecdsa",
 							"emdash > @emdash-cms/auth > @oslojs/crypto/sha2",
 							"emdash > @emdash-cms/auth > @oslojs/webauthn",
+							// MCP SDK — server/index.js statically imports ajv (CJS-only).
+							// Pre-bundling converts CJS to ESM so workerd can load it.
+							"emdash > @modelcontextprotocol/sdk > ajv",
+							"emdash > @modelcontextprotocol/sdk > ajv-formats",
 							// React (commonly used, may be hoisted)
 							"react",
 							"react/jsx-dev-runtime",

@@ -6,7 +6,6 @@
 
 import type { APIRoute } from "astro";
 
-import { requirePerm } from "#api/authorize.js";
 import { apiError, apiSuccess, handleError } from "#api/error.js";
 import { isParseError, parseQuery } from "#api/parse.js";
 import { searchQuery } from "#api/schemas.js";
@@ -24,10 +23,7 @@ export const prerender = false;
  * - limit: Maximum results (optional, defaults to 20)
  */
 export const GET: APIRoute = async ({ url, locals }) => {
-	const { emdash, user } = locals;
-
-	const denied = requirePerm(user, "search:read");
-	if (denied) return denied;
+	const { emdash } = locals;
 
 	if (!emdash?.db) {
 		return apiError("NOT_CONFIGURED", "EmDash not configured", 500);
@@ -41,6 +37,11 @@ export const GET: APIRoute = async ({ url, locals }) => {
 		: undefined;
 
 	try {
+		// Verify FTS indexes are healthy on first use. At most once per worker
+		// lifetime; no-op after that. Moved off the cold-start hot path to
+		// keep anonymous public reads fast.
+		await emdash.ensureSearchHealthy?.();
+
 		const result = await searchWithDb(emdash.db, query.q, {
 			collections,
 			status: query.status,

@@ -1,6 +1,6 @@
 {
   "name": "emdash",
-  "version": "0.1.0",
+  "version": "0.6.0",
   "description": "Astro-native CMS with WordPress migration support",
   "type": "module",
   "main": "dist/index.mjs",
@@ -60,6 +60,10 @@
     "./db/postgres": {
       "types": "./dist/db/postgres.d.mts",
       "default": "./dist/db/postgres.mjs"
+    },
+    "./database/instrumentation": {
+      "types": "./dist/database/instrumentation.d.mts",
+      "default": "./dist/database/instrumentation.mjs"
     },
     "./storage/local": {
       "types": "./dist/storage/local.d.mts",
@@ -141,6 +145,9 @@
     "#media/*": "./src/media/*",
     "#mcp/*": "./src/mcp/*",
     "#comments/*": "./src/comments/*",
+    "#bylines/*": "./src/bylines/*",
+    "#taxonomies/*": "./src/taxonomies/*",
+    "#redirects/*": "./src/redirects/*",
     "#types": "./src/astro/types.js"
   },
   "scripts": {
@@ -150,7 +157,8 @@
     "typecheck": "tsgo --noEmit",
     "check": "publint && attw --pack --ignore-rules=cjs-resolves-to-esm --ignore-rules=no-resolution --ignore-rules=internal-resolution-error",
     "test": "vitest",
-    "test:smoke": "vitest run --config vitest.smoke.config.ts"
+    "test:smoke": "vitest run --config vitest.smoke.config.ts",
+    "test:integration": "vitest run --config vitest.integration.config.ts"
   },
   "dependencies": {
     "@emdash-cms/admin": "workspace:*",

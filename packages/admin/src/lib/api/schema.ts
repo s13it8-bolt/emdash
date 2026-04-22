@@ -7,6 +7,7 @@ import { API_BASE, apiFetch, parseApiResponse, throwResponseError } from "./clie
 export type FieldType =
 	| "string"
 	| "text"
+	| "url"
 	| "number"
 	| "integer"
 	| "boolean"
@@ -18,7 +19,8 @@ export type FieldType =
 	| "file"
 	| "reference"
 	| "json"
-	| "slug";
+	| "slug"
+	| "repeater";
 
 export interface SchemaCollection {
 	id: string;

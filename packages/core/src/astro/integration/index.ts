@@ -14,6 +14,7 @@ import type { AstroIntegration, AstroIntegrationLogger } from "astro";
 
 import type { ResolvedPlugin } from "../../plugins/types.js";
 import { local } from "../storage/adapters.js";
+import { notoSans } from "./font-provider.js";
 import { injectCoreRoutes, injectBuiltinAuthRoutes, injectMcpRoute } from "./routes.js";
 import type { EmDashConfig, PluginDescriptor } from "./runtime.js";
 import { createViteConfig } from "./vite-config.js";
@@ -90,6 +91,27 @@ export function emdash(config: EmDashConfig = {}): AstroIntegration {
 		}
 	}
 
+	// Validate siteUrl if provided in astro.config.mjs.
+	// Env-var fallback (EMDASH_SITE_URL / SITE_URL) is handled at runtime by
+	// getPublicOrigin() in api/public-url.ts — NOT here — so Docker images built
+	// without a domain can pick it up at container start via process.env.
+	if (resolvedConfig.siteUrl) {
+		const raw = resolvedConfig.siteUrl;
+		try {
+			const parsed = new URL(raw);
+			if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+				throw new Error(`siteUrl must be http or https (got ${parsed.protocol})`);
+			}
+			// Always store origin-normalized value (no path) — security invariant L-1
+			resolvedConfig.siteUrl = parsed.origin;
+		} catch (e) {
+			if (e instanceof TypeError) {
+				throw new Error(`Invalid siteUrl: "${raw}"`, { cause: e });
+			}
+			throw e;
+		}
+	}
+
 	// Plugin descriptors from config
 	const pluginDescriptors = resolvedConfig.plugins ?? [];
 	const sandboxedDescriptors = resolvedConfig.sandboxed ?? [];
@@ -136,6 +158,9 @@ export function emdash(config: EmDashConfig = {}): AstroIntegration {
 		storage: resolvedConfig.storage,
 		auth: resolvedConfig.auth,
 		marketplace: resolvedConfig.marketplace,
+		siteUrl: resolvedConfig.siteUrl,
+		maxUploadSize: resolvedConfig.maxUploadSize,
+		admin: resolvedConfig.admin,
 	};
 
 	// Determine auth mode for route injection
@@ -167,8 +192,66 @@ export function emdash(config: EmDashConfig = {}): AstroIntegration {
 					};
 				}
 
-				// Update Vite config with virtual modules and other settings
+				// Disable Astro's built-in checkOrigin -- EmDash's own CSRF
+				// layer (checkPublicCsrf in api/csrf.ts) handles origin
+				// validation with dual-origin support: it accepts both the
+				// internal origin AND the public origin from getPublicOrigin(),
+				// which resolves siteUrl from config or env vars at runtime.
+				// Astro's check can't do this because allowedDomains is baked
+				// at build time, which breaks Docker deployments where the
+				// domain is only known at container start via EMDASH_SITE_URL.
+				//
+				// When siteUrl is known at build time, also set allowedDomains
+				// so Astro.url reflects the public origin (helps user template
+				// code that reads Astro.url directly).
+				const securityConfig: Record<string, unknown> = {
+					checkOrigin: false,
+					...(resolvedConfig.siteUrl
+						? { allowedDomains: [{ hostname: new URL(resolvedConfig.siteUrl).hostname }] }
+						: {}),
+				};
+
+				// Inject default Noto Sans font for the admin UI.
+				// Uses the Astro Font API so fonts are downloaded at build time
+				// and self-hosted (no runtime CDN requests).
+				//
+				// The admin CSS references var(--font-emdash) with a system font
+				// fallback. Users can add extra script coverage (Arabic, CJK, etc.)
+				// by passing fonts.scripts in the emdash() config. The custom
+				// notoSans provider resolves all script families from Google Fonts
+				// under a single font-family name, so they stack via unicode-range.
+				const fontsConfig = resolvedConfig.fonts;
+				const emdashFonts =
+					fontsConfig === false
+						? []
+						: [
+								{
+									provider: notoSans({
+										scripts: fontsConfig?.scripts,
+									}),
+									name: "Noto Sans",
+									cssVariable: "--font-emdash",
+									weights: ["100 900" as const],
+									styles: ["normal" as const, "italic" as const],
+									subsets: [
+										"latin" as const,
+										"latin-ext" as const,
+										"cyrillic" as const,
+										"cyrillic-ext" as const,
+										"devanagari" as const,
+										"greek" as const,
+										"greek-ext" as const,
+										"vietnamese" as const,
+									],
+									fallbacks: ["ui-sans-serif", "system-ui", "sans-serif"],
+								},
+							];
+
 				updateConfig({
+					security: securityConfig,
+					// fonts is a valid AstroConfig key but may not be in the
+					// type definition for the minimum supported Astro version
+					...({ fonts: emdashFonts } as Record<string, unknown>),
 					vite: createViteConfig(
 						{
 							serializableConfig,
@@ -188,10 +271,9 @@ export function emdash(config: EmDashConfig = {}): AstroIntegration {
 					injectBuiltinAuthRoutes(injectRoute);
 				}
 
-				// Inject MCP endpoint when enabled
-				if (resolvedConfig.mcp) {
+				// Inject MCP endpoint (always on — bearer-token-only, no cost if unused)
+				if (resolvedConfig.mcp !== false) {
 					injectMcpRoute(injectRoute);
-					logger.info("MCP server enabled at /_emdash/api/mcp");
 				}
 
 				// In playground mode, inject the playground middleware FIRST.

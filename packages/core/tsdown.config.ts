@@ -1,4 +1,16 @@
+import { execSync } from "node:child_process";
+import { readFileSync } from "node:fs";
+
 import { defineConfig } from "tsdown";
+
+const pkg = JSON.parse(readFileSync("package.json", "utf-8")) as { version: string };
+const commit = (() => {
+	try {
+		return execSync("git rev-parse --short HEAD", { encoding: "utf-8" }).trim();
+	} catch {
+		return "unknown";
+	}
+})();
 
 export default defineConfig({
 	entry: [
@@ -18,6 +30,8 @@ export default defineConfig({
 		"src/db/sqlite.ts",
 		"src/db/libsql.ts",
 		"src/db/postgres.ts",
+		// Query instrumentation (used by first-party adapters like @emdash-cms/cloudflare)
+		"src/database/instrumentation.ts",
 		// Storage adapters (runtime - loaded via virtual:emdash/storage)
 		"src/storage/local.ts",
 		"src/storage/s3.ts",
@@ -45,6 +59,10 @@ export default defineConfig({
 	format: "esm",
 	dts: true,
 	clean: true,
+	define: {
+		__EMDASH_VERSION__: JSON.stringify(pkg.version),
+		__EMDASH_COMMIT__: JSON.stringify(commit),
+	},
 	// Externalize native modules, dialect-specific packages, and internal shared modules
 	external: [
 		// Native modules that use __filename

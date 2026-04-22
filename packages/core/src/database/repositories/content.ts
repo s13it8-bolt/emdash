@@ -3,6 +3,7 @@ import { ulid } from "ulidx";
 
 import { slugify } from "../../utils/slugify.js";
 import type { Database } from "../types.js";
+import { validateIdentifier } from "../validate.js";
 import { RevisionRepository } from "./revision.js";
 import type {
 	CreateContentInput,
@@ -41,6 +42,7 @@ const SYSTEM_COLUMNS = new Set([
  * Get the table name for a collection type
  */
 function getTableName(type: string): string {
+	validateIdentifier(type, "collection type");
 	return `ec_${type}`;
 }
 
@@ -116,6 +118,7 @@ export class ContentRepository {
 			locale,
 			translationOf,
 			publishedAt,
+			createdAt,
 		} = input;
 
 		// Validate required fields
@@ -155,7 +158,7 @@ export class ContentRepository {
 			status,
 			authorId || null,
 			primaryBylineId ?? null,
-			now,
+			createdAt || now,
 			now,
 			publishedAt || null,
 			1,
@@ -167,6 +170,7 @@ export class ContentRepository {
 		if (data && typeof data === "object") {
 			for (const [key, value] of Object.entries(data)) {
 				if (!SYSTEM_COLUMNS.has(key)) {
+					validateIdentifier(key, "content field name");
 					columns.push(key);
 					values.push(serializeValue(value));
 				}
@@ -577,6 +581,7 @@ export class ContentRepository {
 		if (input.data !== undefined && typeof input.data === "object") {
 			for (const [key, value] of Object.entries(input.data)) {
 				if (!SYSTEM_COLUMNS.has(key)) {
+					validateIdentifier(key, "content field name");
 					updates[key] = serializeValue(value);
 				}
 			}
@@ -765,6 +770,27 @@ export class ContentRepository {
 
 		const result = await query.executeTakeFirst();
 		return Number(result?.count || 0);
+	}
+
+	// get overall statistics (total, published, draft) for a content type in a single query
+	async getStats(type: string): Promise<{ total: number; published: number; draft: number }> {
+		const tableName = getTableName(type);
+
+		const result = await this.db
+			.selectFrom(tableName as keyof Database)
+			.select((eb) => [
+				eb.fn.count("id").as("total"),
+				eb.fn.sum(eb.case().when("status", "=", "published").then(1).else(0).end()).as("published"),
+				eb.fn.sum(eb.case().when("status", "=", "draft").then(1).else(0).end()).as("draft"),
+			])
+			.where("deleted_at" as never, "is", null)
+			.executeTakeFirst();
+
+		return {
+			total: Number(result?.total || 0),
+			published: Number(result?.published || 0),
+			draft: Number(result?.draft || 0),
+		};
 	}
 
 	/**
@@ -1006,6 +1032,45 @@ export class ContentRepository {
 	}
 
 	/**
+	 * Set the draft revision pointer for a content item.
+	 *
+	 * Used by seed/import paths that stage a new revision's data before
+	 * promoting it to live via `publish()`.
+	 *
+	 * Validates that the content item exists and is not soft-deleted, that
+	 * the revision exists, and that the revision belongs to the same
+	 * collection and entry. Without these checks, a caller could leave the
+	 * content row pointing at a missing or unrelated revision.
+	 */
+	async setDraftRevision(type: string, id: string, revisionId: string): Promise<void> {
+		const tableName = getTableName(type);
+		const now = new Date().toISOString();
+
+		const existing = await this.findById(type, id);
+		if (!existing) {
+			throw new EmDashValidationError("Content item not found");
+		}
+
+		const revisionRepo = new RevisionRepository(this.db);
+		const revision = await revisionRepo.findById(revisionId);
+		if (!revision) {
+			throw new EmDashValidationError("Revision not found");
+		}
+
+		if (revision.collection !== type || revision.entryId !== id) {
+			throw new EmDashValidationError("Revision does not belong to the specified content item");
+		}
+
+		await sql`
+			UPDATE ${sql.ref(tableName)}
+			SET draft_revision_id = ${revisionId},
+				updated_at = ${now}
+			WHERE id = ${id}
+			AND deleted_at IS NULL
+		`.execute(this.db);
+	}
+
+	/**
 	 * Discard pending draft changes
 	 *
 	 * Clears draft_revision_id. The content table columns already hold the
@@ -1057,6 +1122,7 @@ export class ContentRepository {
 		for (const [key, value] of Object.entries(data)) {
 			if (SYSTEM_COLUMNS.has(key)) continue;
 			if (key.startsWith("_")) continue; // revision metadata
+			validateIdentifier(key, "content field name");
 			updates[key] = serializeValue(value);
 		}
 

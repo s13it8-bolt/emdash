@@ -11,6 +11,7 @@ import { MediaRepository } from "../database/repositories/media.js";
 import { OptionsRepository } from "../database/repositories/options.js";
 import type { Database } from "../database/types.js";
 import { getDb } from "../loader.js";
+import { peekRequestCache, requestCached } from "../request-cache.js";
 import type { Storage } from "../storage/types.js";
 import type { SiteSettings, SiteSettingKey, MediaReference } from "./types.js";
 
@@ -75,8 +76,24 @@ async function resolveMediaReference(
 export async function getSiteSetting<K extends SiteSettingKey>(
 	key: K,
 ): Promise<SiteSettings[K] | undefined> {
-	const db = await getDb();
-	return getSiteSettingWithDb(key, db);
+	// If `getSiteSettings()` has already been called in this request,
+	// read from that (request-cached) batch rather than firing a second
+	// options-table query. Common layout: a Base template pulls the
+	// whole settings object up-front, then `EmDashHead` or a plugin
+	// asks for one key — no reason the singular call should round-trip
+	// again.
+	const primed = peekRequestCache<Partial<SiteSettings>>("siteSettings");
+	if (primed) {
+		const settings = await primed;
+		return settings[key];
+	}
+
+	// Otherwise cache per-key. Templates that pull several settings
+	// independently still share the in-flight query for each one.
+	return requestCached(`siteSetting:${key}`, async () => {
+		const db = await getDb();
+		return getSiteSettingWithDb(key, db);
+	});
 }
 
 /**
@@ -124,9 +141,11 @@ export async function getSiteSettingWithDb<K extends SiteSettingKey>(
  * console.log(settings.logo?.url); // "/_emdash/api/media/file/abc123"
  * ```
  */
-export async function getSiteSettings(): Promise<Partial<SiteSettings>> {
-	const db = await getDb();
-	return getSiteSettingsWithDb(db);
+export function getSiteSettings(): Promise<Partial<SiteSettings>> {
+	return requestCached("siteSettings", async () => {
+		const db = await getDb();
+		return getSiteSettingsWithDb(db);
+	});
 }
 
 /**
@@ -200,4 +219,68 @@ export async function setSiteSettings(
 	}
 
 	await options.setMany(updates);
+}
+
+/**
+ * Get a single plugin setting by key.
+ *
+ * Plugin settings are stored in the options table under
+ * `plugin:<pluginId>:settings:<key>`.
+ */
+export async function getPluginSetting<T = unknown>(
+	pluginId: string,
+	key: string,
+): Promise<T | undefined> {
+	const db = await getDb();
+	return getPluginSettingWithDb<T>(pluginId, key, db);
+}
+
+/**
+ * Get a single plugin setting by key (with explicit db).
+ *
+ * @internal Use `getPluginSetting()` in templates and plugin rendering code.
+ */
+export async function getPluginSettingWithDb<T = unknown>(
+	pluginId: string,
+	key: string,
+	db: Kysely<Database>,
+): Promise<T | undefined> {
+	const options = new OptionsRepository(db);
+	const value = await options.get<T>(`plugin:${pluginId}:settings:${key}`);
+	return value ?? undefined;
+}
+
+/**
+ * Get all persisted plugin settings for a plugin.
+ *
+ * Defaults declared in `admin.settingsSchema` are not materialized
+ * automatically; callers should apply their own fallback defaults.
+ */
+export async function getPluginSettings(pluginId: string): Promise<Record<string, unknown>> {
+	const db = await getDb();
+	return getPluginSettingsWithDb(pluginId, db);
+}
+
+/**
+ * Get all persisted plugin settings for a plugin (with explicit db).
+ *
+ * @internal Use `getPluginSettings()` in templates and plugin rendering code.
+ */
+export async function getPluginSettingsWithDb(
+	pluginId: string,
+	db: Kysely<Database>,
+): Promise<Record<string, unknown>> {
+	const prefix = `plugin:${pluginId}:settings:`;
+	const options = new OptionsRepository(db);
+	const allOptions = await options.getByPrefix(prefix);
+
+	const settings: Record<string, unknown> = {};
+	for (const [key, value] of allOptions) {
+		if (!key.startsWith(prefix)) {
+			continue;
+		}
+		settings[key.slice(prefix.length)] = value;
+	}
+
+	return settings;
 }

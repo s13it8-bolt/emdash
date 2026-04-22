@@ -12,6 +12,21 @@ import { BylineRepository } from "../database/repositories/byline.js";
 import type { BylineSummary, ContentBylineCredit } from "../database/repositories/types.js";
 import { validateIdentifier } from "../database/validate.js";
 import { getDb } from "../loader.js";
+import { chunks, SQL_BATCH_SIZE } from "../utils/chunks.js";
+import { isMissingTableError } from "../utils/db-errors.js";
+
+/**
+ * No-op — kept for API compatibility.
+ *
+ * Used to invalidate a worker-lifetime "has any byline?" probe. That
+ * probe added a query on every cold isolate to save one query on sites
+ * with zero bylines (i.e. the wrong tradeoff), so we dropped it. The
+ * batch byline join below returns an empty map for empty sites at the
+ * same cost as the probe, without the pre-check.
+ */
+export function invalidateBylineCache(): void {
+	// Intentionally empty.
+}
 
 /**
  * Get a byline by ID.
@@ -136,8 +151,19 @@ export async function getBylinesForEntries(
 	const db = await getDb();
 	const repo = new BylineRepository(db);
 
-	// 1. Batch fetch all explicit byline credits
-	const bylinesMap = await repo.getContentBylinesMany(collection, entryIds);
+	// 1. Batch fetch all explicit byline credits. Sites with no bylines
+	// get an empty map back for one query — the previous "has any bylines"
+	// probe traded an extra round-trip on every request to save that one
+	// query on empty sites, which is exactly backwards for the common case.
+	// Pre-migration databases (bylines table missing) fall through to the
+	// `isMissingTableError` catch below and return empty results.
+	let bylinesMap;
+	try {
+		bylinesMap = await repo.getContentBylinesMany(collection, entryIds);
+	} catch (error) {
+		if (isMissingTableError(error)) return result;
+		throw error;
+	}
 
 	// 2. Collect entry IDs that need fallback lookup
 	const fallbackEntryIds: string[] = [];
@@ -198,8 +224,8 @@ async function getAuthorId(
 	collection: string,
 	entryId: string,
 ): Promise<string | null> {
+	validateIdentifier(collection, "collection");
 	const tableName = `ec_${collection}`;
-	validateIdentifier(tableName, "content table");
 
 	const result = await sql<{ author_id: string | null }>`
 		SELECT author_id FROM ${sql.ref(tableName)}
@@ -219,18 +245,20 @@ async function getAuthorIds(
 	collection: string,
 	entryIds: string[],
 ): Promise<Map<string, string>> {
+	validateIdentifier(collection, "collection");
 	const tableName = `ec_${collection}`;
-	validateIdentifier(tableName, "content table");
-
-	const result = await sql<{ id: string; author_id: string | null }>`
-		SELECT id, author_id FROM ${sql.ref(tableName)}
-		WHERE id IN (${sql.join(entryIds.map((id) => sql`${id}`))})
-	`.execute(db);
 
 	const map = new Map<string, string>();
-	for (const row of result.rows) {
-		if (row.author_id) {
-			map.set(row.id, row.author_id);
+	for (const chunk of chunks(entryIds, SQL_BATCH_SIZE)) {
+		const result = await sql<{ id: string; author_id: string | null }>`
+			SELECT id, author_id FROM ${sql.ref(tableName)}
+			WHERE id IN (${sql.join(chunk.map((id) => sql`${id}`))})
+		`.execute(db);
+
+		for (const row of result.rows) {
+			if (row.author_id) {
+				map.set(row.id, row.author_id);
+			}
 		}
 	}
 	return map;

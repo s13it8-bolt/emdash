@@ -11,6 +11,7 @@
 export type FieldType =
 	| "string"
 	| "text"
+	| "url"
 	| "number"
 	| "integer"
 	| "boolean"
@@ -22,7 +23,8 @@ export type FieldType =
 	| "file"
 	| "reference"
 	| "json"
-	| "slug";
+	| "slug"
+	| "repeater";
 
 /**
  * Array of all field types for validation
@@ -30,6 +32,7 @@ export type FieldType =
 export const FIELD_TYPES: readonly FieldType[] = [
 	"string",
 	"text",
+	"url",
 	"number",
 	"integer",
 	"boolean",
@@ -42,6 +45,7 @@ export const FIELD_TYPES: readonly FieldType[] = [
 	"reference",
 	"json",
 	"slug",
+	"repeater",
 ] as const;
 
 /**
@@ -67,6 +71,8 @@ export const FIELD_TYPE_TO_COLUMN: Record<FieldType, ColumnType> = {
 	reference: "TEXT",
 	json: "JSON",
 	slug: "TEXT",
+	url: "TEXT",
+	repeater: "JSON",
 };
 
 /**
@@ -93,6 +99,27 @@ export type CollectionSource =
 /**
  * Validation rules for a field
  */
+/** Sub-field definition for repeater fields */
+export interface RepeaterSubField {
+	slug: string;
+	type: "string" | "text" | "url" | "number" | "integer" | "boolean" | "datetime" | "select";
+	label: string;
+	required?: boolean;
+	options?: string[]; // For select sub-fields
+}
+
+/** Allowed types for repeater sub-fields (no nesting, no complex types) */
+export const REPEATER_SUB_FIELD_TYPES = [
+	"string",
+	"text",
+	"url",
+	"number",
+	"integer",
+	"boolean",
+	"datetime",
+	"select",
+] as const;
+
 export interface FieldValidation {
 	required?: boolean;
 	min?: number;
@@ -101,6 +128,9 @@ export interface FieldValidation {
 	maxLength?: number;
 	pattern?: string;
 	options?: string[]; // For select/multiSelect
+	subFields?: RepeaterSubField[]; // For repeater fields
+	minItems?: number; // For repeater fields
+	maxItems?: number; // For repeater fields
 }
 
 /**
@@ -244,7 +274,10 @@ export interface CollectionWithFields extends Collection {
 }
 
 /**
- * Reserved field slugs that cannot be used
+ * Reserved field slugs that cannot be used.
+ *
+ * Includes names reserved for runtime hydration (`terms`, `bylines`, `byline`)
+ * so user-defined fields never shadow the auto-hydrated values on entry.data.
  */
 export const RESERVED_FIELD_SLUGS = [
 	"id",
@@ -260,6 +293,10 @@ export const RESERVED_FIELD_SLUGS = [
 	"version",
 	"live_revision_id",
 	"draft_revision_id",
+	// Runtime-hydrated fields
+	"terms",
+	"bylines",
+	"byline",
 ];
 
 /**
